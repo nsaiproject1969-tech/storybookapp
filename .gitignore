@@ -1,0 +1,9 @@
+# Global ignores
+.DS_Store
+.env
+
+# Mac / Windows
+Thumbs.db
+
+# Logs
+*.log
