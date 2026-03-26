@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 
 from openai import OpenAI
 from dotenv import load_dotenv
+import asyncio
+
 
 from story import STORY
 
@@ -23,11 +25,6 @@ from reportlab.lib.styles import getSampleStyleSheet
 load_dotenv()
 
 app = FastAPI()
-
-@app.middleware("http")
-async def log_requests(request, call_next):
-    print("🌐 REQUEST:", request.url)
-    return await call_next(request)
 
 OUTPUT_DIR = "generated"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -42,14 +39,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 LEONARDO_API_KEY = os.getenv("LEONARDO_API_KEY")
-
-if not LEONARDO_API_KEY:
-    print("❌ ERROR: LEONARDO_API_KEY missing")
 
 LEONARDO_HEADERS = {
     "accept": "application/json",
@@ -58,15 +49,16 @@ LEONARDO_HEADERS = {
 }
 
 # -----------------------------
-# Prompt
+# ✅ COMMON PROMPT BUILDER
 # -----------------------------
-BASE_CHARACTER = """
-Same 10-year-old boy Yosei,
-short black hair, soft eyes, slightly shy expression,
-wearing a light blue t-shirt, brown shorts, school bag,
-consistent character, children's book illustration,
-watercolor, pastel colors
-"""
+def build_prompt(page):
+    return f"""
+    {STORY['style']['art_style']},
+    {STORY['main_character']['description']},
+    {STORY['setting']},
+    {page['image_prompt']},
+    consistent character, same face, same outfit
+    """
 
 # =========================================================
 # ✅ OPENAI STREAM
@@ -77,23 +69,26 @@ def stream_story():
     def generate():
         print("🚀 OPENAI STREAM STARTED")
 
-        for i, item in enumerate(STORY):
+        for i, page in enumerate(STORY["pages"]):
             yield ": heartbeat\n\n"
 
             file_path = f"{OUTPUT_DIR}/page_{i}.png"
 
-            if not os.path.exists(file_path):
-                print(f"🔥 OpenAI generating page {i}")
+            try:
+                if not os.path.exists(file_path):
+                    print(f"🔥 OpenAI generating page {i}")
 
-                prompt = f"{BASE_CHARACTER} {item['scene']}"
+                    prompt = build_prompt(page)
+                    try:
 
-                try:
-                    result = client.images.generate(
-                        model="gpt-image-1",
-                        prompt=prompt,
-                        size="1024x1024"
-                    )
-
+                        result = client.images.generate(
+                            model="gpt-image-1",
+                            prompt=prompt,
+                            size="1024x1024"
+                        )
+                    except Exception as e:
+                        print("timeout or error")
+                    
                     img_base64 = result.data[0].b64_json
                     img_bytes = base64.b64decode(img_base64)
 
@@ -102,18 +97,29 @@ def stream_story():
 
                     print(f"✅ OpenAI saved: {file_path}")
 
-                except Exception as e:
-                    print("❌ OpenAI ERROR:", e)
+                else:
+                    print(f"✅ OpenAI cached: {file_path}")
 
-            data = {
-                "image": f"http://127.0.0.1:8000/generated/page_{i}.png",
-                "text": item["text"],
-                "index": i,
-                "source": "openai"
-            }
+                data = {
+                    "image": f"http://127.0.0.1:8000/generated/page_{i}.png",
+                    "text": page["text"],
+                    "index": i,
+                    "source": "openai"
+                }
+
+            except Exception as e:
+                print(f"❌ OpenAI ERROR page {i}:", e)
+
+                # 👇 IMPORTANT: send fallback so UI doesn't hang
+                data = {
+                    "image": None,
+                    "text": f"Error generating image (page {i})",
+                    "index": i,
+                    "source": "openai"
+                }
 
             yield f"data: {json.dumps(data)}\n\n"
-            time.sleep(0.1)
+            time.sleep(0.2)        
 
         yield "event: end\ndata: done\n\n"
 
@@ -121,9 +127,9 @@ def stream_story():
 
 
 # =========================================================
-# ✅ LEONARDO GENERATION
+# ✅ LEONARDO IMAGE GENERATION
 # =========================================================
-def generate_image_leonardo(scene, index):
+def generate_image_leonardo(page, index):
 
     file_path = f"{OUTPUT_DIR}/leo_page_{index}.png"
 
@@ -131,7 +137,7 @@ def generate_image_leonardo(scene, index):
         print(f"✅ Leonardo cached: {file_path}")
         return file_path
 
-    prompt = f"{BASE_CHARACTER} {scene}"
+    prompt = build_prompt(page)
 
     payload = {
         "prompt": prompt,
@@ -141,7 +147,7 @@ def generate_image_leonardo(scene, index):
         "num_images": 1
     }
 
-    print("🔥 Leonardo generating:", index)
+    print(f"🔥 Leonardo generating page {index}")
 
     response = requests.post(
         "https://cloud.leonardo.ai/api/rest/v1/generations",
@@ -149,18 +155,16 @@ def generate_image_leonardo(scene, index):
         headers=LEONARDO_HEADERS
     )
 
-    print("📡 Leonardo response:", response.text)
-
     data = response.json()
 
     try:
         generation_id = data["sdGenerationJob"]["generationId"]
-    except Exception as e:
+    except:
         raise Exception(f"Leonardo failed: {data}")
 
     image_url = None
 
-    for attempt in range(20):
+    for _ in range(20):
         time.sleep(2)
 
         status = requests.get(
@@ -168,18 +172,16 @@ def generate_image_leonardo(scene, index):
             headers=LEONARDO_HEADERS
         ).json()
 
-        print(f"⏳ Leonardo polling {attempt}:", status)
-
         try:
             images = status["generations_by_pk"]["generated_images"]
             if images:
                 image_url = images[0]["url"]
                 break
-        except Exception as e:
-            print("⚠️ Polling error:", e)
+        except:
+            pass
 
     if not image_url:
-        raise Exception("❌ Leonardo generation timeout")
+        raise Exception("❌ Leonardo timeout")
 
     img_bytes = requests.get(image_url).content
 
@@ -200,15 +202,15 @@ def stream_story_leonardo():
     def generate():
         print("🚀 LEONARDO STREAM STARTED")
 
-        for i, item in enumerate(STORY):
+        for i, page in enumerate(STORY["pages"]):
             yield ": heartbeat\n\n"
 
             try:
-                generate_image_leonardo(item["scene"], i)
+                generate_image_leonardo(page, i)
 
                 data = {
                     "image": f"http://127.0.0.1:8000/generated/leo_page_{i}.png",
-                    "text": item["text"],
+                    "text": page["text"],
                     "index": i,
                     "source": "leonardo"
                 }
@@ -238,15 +240,15 @@ def export_pdf():
 
     story_flow = []
 
-    for i, item in enumerate(STORY):
-        img_path = os.path.join(BASE_DIR, OUTPUT_DIR, f"page_{i}.png")
+    for i, page in enumerate(STORY["pages"]):
+        img_path = f"{OUTPUT_DIR}/page_{i}.png"
 
         if not os.path.exists(img_path):
-            raise Exception(f"Image not ready: {img_path}")
+            raise Exception(f"Image missing: {img_path}")
 
         story_flow.append(RLImage(img_path, width=400, height=400))
         story_flow.append(Spacer(1, 20))
-        story_flow.append(Paragraph(item["text"], styles["Normal"]))
+        story_flow.append(Paragraph(page["text"], styles["Normal"]))
         story_flow.append(Spacer(1, 40))
 
     doc.build(story_flow)
