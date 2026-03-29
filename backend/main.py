@@ -46,16 +46,21 @@ LEONARDO_HEADERS = {
     "content-type": "application/json"
 }
 
+# -----------------------------
+# Benchmark Settings
+# -----------------------------
+USE_CACHE = False   # 🔥 Set False for real speed testing
+LOG_FILE = "performance_log.json"
+
 # =========================================================
-# ✅ SEED STRATEGY
+# Seed Strategy
 # =========================================================
 def get_seed(index):
-    teacher_pages = [5, 11]  # pages where teacher appears
+    teacher_pages = [5, 11]
     return 222 if index in teacher_pages else 111
 
-
 # =========================================================
-# ✅ PROMPT BUILDER (UPDATED WITH STYLE)
+# Prompt Builder
 # =========================================================
 def build_prompt(page):
     return f"""
@@ -77,31 +82,38 @@ Composition:
 simple, clean, focused on main subject, gentle storytelling mood
 """
 
-
 # =========================================================
-# ✅ LEONARDO NEGATIVE PROMPT
+# Leonardo Negative Prompt
 # =========================================================
 LEONARDO_NEGATIVE = """
 duplicate characters, extra children, crowded scenes,
 classroom setting, group of kids, anime style, 3d render
 """
 
+# =========================================================
+# Logging Helper
+# =========================================================
+def log_performance(entry):
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 # =========================================================
-# ✅ OPENAI STREAM (WITH RETRY + VERSIONING)
+# OpenAI Stream
 # =========================================================
 @app.get("/stream-story")
 def stream_story():
 
     def generate():
+        total_start = time.time()
+
         for i, page in enumerate(STORY12["pages"]):
             yield ": heartbeat\n\n"
 
-            # 🔥 VERSIONED FILE (prevents cache bugs)
             file_path = f"{OUTPUT_DIR}/v3_page_{i}.png"
+            start_time = time.time()
 
             try:
-                if not os.path.exists(file_path):
+                if not USE_CACHE or not os.path.exists(file_path):
                     print(f"🔥 OpenAI generating page {i}")
 
                     prompt = build_prompt(page)
@@ -124,11 +136,23 @@ def stream_story():
                     with open(file_path, "wb") as f:
                         f.write(img_bytes)
 
+                generation_time = round(time.time() - start_time, 2)
+
+                # log
+                log_performance({
+                    "page": i,
+                    "source": "openai",
+                    "generation_time": generation_time,
+                    "timestamp": time.time()
+                })
+
                 data = {
                     "image": f"http://127.0.0.1:8000/generated/v3_page_{i}.png",
                     "text": page["text"],
                     "index": i,
-                    "source": "openai"
+                    "source": "openai",
+                    "generation_time": generation_time,
+                    "server_timestamp": time.time()
                 }
 
             except Exception as e:
@@ -144,21 +168,21 @@ def stream_story():
             yield f"data: {json.dumps(data)}\n\n"
             time.sleep(0.2)
 
+        print("✅ OpenAI TOTAL TIME:", round(time.time() - total_start, 2), "s")
         yield "event: end\ndata: done\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-
 # =========================================================
-# ✅ LEONARDO IMAGE GENERATION (WITH SEED + VERSIONING)
+# Leonardo Image Generation
 # =========================================================
 def generate_image_leonardo(page, index):
 
     file_path = f"{OUTPUT_DIR}/v3_leo_page_{index}.png"
+    start_time = time.time()
 
-    if os.path.exists(file_path):
-        print(f"✅ Leonardo cached: {file_path}")
-        return file_path
+    if USE_CACHE and os.path.exists(file_path):
+        return file_path, 0
 
     prompt = build_prompt(page)
 
@@ -174,7 +198,7 @@ def generate_image_leonardo(page, index):
         "num_inference_steps": 28
     }
 
-    print(f"🔥 Leonardo generating page {index} with seed {get_seed(index)}")
+    print(f"🔥 Leonardo generating page {index}")
 
     response = requests.post(
         "https://cloud.leonardo.ai/api/rest/v1/generations",
@@ -183,11 +207,7 @@ def generate_image_leonardo(page, index):
     )
 
     data = response.json()
-
-    try:
-        generation_id = data["sdGenerationJob"]["generationId"]
-    except:
-        raise Exception(f"Leonardo failed: {data}")
+    generation_id = data["sdGenerationJob"]["generationId"]
 
     image_url = None
 
@@ -208,34 +228,46 @@ def generate_image_leonardo(page, index):
             pass
 
     if not image_url:
-        raise Exception("❌ Leonardo timeout")
+        raise Exception("Leonardo timeout")
 
     img_bytes = requests.get(image_url).content
 
     with open(file_path, "wb") as f:
         f.write(img_bytes)
 
-    return file_path
+    generation_time = round(time.time() - start_time, 2)
 
+    return file_path, generation_time
 
 # =========================================================
-# ✅ LEONARDO STREAM
+# Leonardo Stream
 # =========================================================
 @app.get("/stream-story-leonardo")
 def stream_story_leonardo():
 
     def generate():
+        total_start = time.time()
+
         for i, page in enumerate(STORY12["pages"]):
             yield ": heartbeat\n\n"
 
             try:
-                generate_image_leonardo(page, i)
+                file_path, gen_time = generate_image_leonardo(page, i)
+
+                log_performance({
+                    "page": i,
+                    "source": "leonardo",
+                    "generation_time": gen_time,
+                    "timestamp": time.time()
+                })
 
                 data = {
                     "image": f"http://127.0.0.1:8000/generated/v3_leo_page_{i}.png",
                     "text": page["text"],
                     "index": i,
-                    "source": "leonardo"
+                    "source": "leonardo",
+                    "generation_time": gen_time,
+                    "server_timestamp": time.time()
                 }
 
                 yield f"data: {json.dumps(data)}\n\n"
@@ -245,13 +277,13 @@ def stream_story_leonardo():
 
             time.sleep(0.1)
 
+        print("✅ Leonardo TOTAL TIME:", round(time.time() - total_start, 2), "s")
         yield "event: end\ndata: done\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-
 # =========================================================
-# ✅ EXPORT PDF
+# Export PDF
 # =========================================================
 @app.get("/export-pdf")
 def export_pdf():
